@@ -46,11 +46,15 @@
 #ifndef __MEM_INTERFACE_HH__
 #define __MEM_INTERFACE_HH__
 
+#include <bitset>
+#include <cstdint>
 #include <deque>
 #include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include "nlohmann/json.hpp"
 
 #include "base/compiler.hh"
 #include "base/statistics.hh"
@@ -100,6 +104,20 @@ class MemInterface : public AbstractMemory
 
         uint32_t rowAccesses;
         uint32_t bytesAccessed;
+
+        // -----------------------------------------------
+        // per-bank state used by the rowhammer model. all containers are
+        // default-constructed (empty) here; the DRAMInterface init code
+        // is responsible for sizing them based on rowsPerBank, TRR table
+        // length, etc.
+        std::vector<std::vector<long int>> rhTriggers;
+        std::vector<std::bitset<1024>> weakColumns;
+        nlohmann::json bank_device_map;
+        std::vector<std::vector<bool>> flagged_entries;
+        std::vector<std::vector<uint64_t>> trr_table;
+        std::vector<std::vector<uint64_t>> companion_table;
+        std::vector<long int> aggressor_rows;
+        // -----------------------------------------------
 
         Bank() :
             openRow(NO_ROW), bank(0), bankgr(0),

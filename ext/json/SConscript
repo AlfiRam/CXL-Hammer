@@ -1,0 +1,11 @@
+# -*- mode:python -*-
+#
+# cxl-hammer: expose nlohmann/json (header-only) to the gem5 build.
+# the library is vendored at ext/json/json/single_include/ (MIT-licensed,
+# see ext/json/json/LICENSE.MIT).
+# include path added here makes `#include "nlohmann/json.hpp"` resolvable
+# from any source under src/.
+
+Import('env')
+
+env.Prepend(CPPPATH=Dir('./json/single_include').srcnode())

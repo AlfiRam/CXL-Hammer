@@ -40,8 +40,13 @@
 
 #include "mem/dram_interface.hh"
 
+#include <cstring>
+#include <fstream>
+#include <limits>
+
 #include "base/bitfield.hh"
 #include "base/cprintf.hh"
+#include "base/logging.hh"
 #include "base/trace.hh"
 #include "debug/DRAM.hh"
 #include "debug/DRAMPower.hh"
@@ -190,6 +195,28 @@ DRAMInterface::activateBank(Rank& rank_ref, Bank& bank_ref,
     // update the open row
     assert(bank_ref.openRow == Bank::NO_ROW);
     bank_ref.openRow = row;
+
+    // ---------------- rowhammer port ----------------
+    // track per-row activation counters for later rowhammer analysis.
+    // gated so zero-overhead when the feature is off. only trr_variant
+    // == 0 (no mitigation) is supported in this port — the TRR table
+    // is allocated to keep the data structure contract but never
+    // consulted.
+    if (_enableMemoryCorruption) {
+        if (!_rhFirstAct) {
+            _rhFirstAct = true;
+            for (auto &b : rank_ref.banks) {
+                b.trr_table.assign(_counterTableLength,
+                                   std::vector<uint64_t>(4, 0));
+                b.companion_table.assign(_companionTableLength,
+                                         std::vector<uint64_t>(4, 0));
+            }
+        }
+        if (row < bank_ref.aggressor_rows.size())
+            bank_ref.aggressor_rows[row]++;
+        rhUpdateTriggers(bank_ref, row);
+    }
+    // ----------------------------------------------------------
 
     // start counting anew, this covers both the case when we
     // auto-precharged, and when this access is forced to
@@ -612,6 +639,92 @@ DRAMInterface::doBurstAccess(MemPacket* mem_pkt, Tick next_burst_at,
         stats.perBankWrBursts[mem_pkt->bankId]++;
 
     }
+
+    // ---------------- rowhammer port ----------------
+    // evaluate rowhammer side effects after the DRAM burst state has
+    // been updated. gated so disabled configurations pay nothing.
+    if (_enableMemoryCorruption)
+        checkRowHammer(bank_ref, mem_pkt);
+    // ----------------------------------------------------------
+
+    // ---------------- rowhammer port (ECC read) ----------
+    // on every read burst, probe the ECC victim map for a snapshot
+    // whose row matches any of the four distances that
+    // doMemoryCorruption() uses ({-2,-1,+1,+2}). if found, recompute
+    // the pre-flip ECC byte over the 8-byte-aligned chunk containing
+    // the flipped byte (decision 1: offset = col & ~7 on both paths),
+    // compare against the live row, and correct or flag per the
+    // SECDED return code. on a successful single-bit correction
+    // (decision 3) we write the corrected 8-byte chunk back to host
+    // memory so subsequent reads and the test program's post-hammer
+    // scan see the healed data. map entries are erased after every
+    // correction attempt so a second flip at the same row gets a
+    // fresh snapshot.
+    if (_enableEcc && mem_pkt->isRead()) {
+        const Addr ctrl_off = getCtrlAddr(mem_pkt->addr);
+        const Addr row_bytes =
+            banksPerRank * burstsPerRowBuffer * burstSize;
+        static const int kLookupDistances[] = {-2, -1, 1, 2};
+
+        for (int d : kLookupDistances) {
+            const Addr addr =
+                range.start() + ctrl_off + d * row_bytes;
+            auto it = _eccVictims.find(addr);
+            if (it == _eccVictims.end())
+                continue;
+
+            const uint16_t col_byte = _eccColumns[addr];
+            const std::size_t offset =
+                col_byte & ~static_cast<std::size_t>(7);
+            uint8_t *snap = it->second;
+
+            uint8_t ecc = computeECCByte_MSBF(_pMatrix.get(),
+                                              snap + offset);
+
+            uint8_t *host_addr = toHostAddr(addr);
+            assert(host_addr);
+            const std::size_t row_size = rowBufferSize;
+            std::vector<uint8_t> dest(row_size);
+            std::memcpy(dest.data(), host_addr, row_size);
+
+            const int rc = correctOneBit_MSBF(
+                dest.data() + offset, &ecc, _pMatrix.get());
+            switch (rc) {
+              case 0:
+                DPRINTF(DRAM, "ECC: unchanged at %#x\n", addr);
+                break;
+              case 1:
+                stats.rowHammerEccCorrected++;
+                DPRINTF(DRAM,
+                        "ECC: corrected at %#x col=%u multi=%u\n",
+                        addr, col_byte,
+                        _eccMultipleErrors[addr]);
+                // scope the write-back to the 8-byte chunk we
+                // touched to minimize blast radius on host memory.
+                std::memcpy(host_addr + offset,
+                            dest.data() + offset, 8);
+                break;
+              case 2:
+                DPRINTF(DRAM,
+                        "ECC: ecc-bit-only flip at %#x\n", addr);
+                break;
+              case -1:
+                stats.rowHammerEccUncorrectable++;
+                DPRINTF(DRAM,
+                        "ECC: uncorrectable multi-bit at %#x\n",
+                        addr);
+                break;
+              default:
+                fatal("correctOneBit_MSBF unexpected rc=%d\n", rc);
+            }
+            delete[] snap;
+            _eccVictims.erase(addr);
+            _eccColumns.erase(addr);
+            _eccMultipleErrors.erase(addr);
+        }
+    }
+    // ---------------------------------------------------------------
+
     // Update bus state to reflect when previous command was issued
     return std::make_pair(cmd_at, cmd_at + burst_gap);
 }
@@ -658,6 +771,25 @@ DRAMInterface::DRAMInterface(const DRAMInterfaceParams &_p)
       timeStampOffset(0), activeRank(0),
       enableDRAMPowerdown(_p.enable_dram_powerdown),
       lastStatsResetTick(0),
+      // ------------- rowhammer port (scaffolding) -------------
+      // parameters are read and stored; no behavior is driven yet.
+      _deviceFile(_p.device_file),
+      _rowhammerThreshold(_p.rowhammer_threshold),
+      _trrVariant(_p.trr_variant),
+      _trrThreshold(_p.trr_threshold),
+      _counterTableLength(_p.counter_table_length),
+      _companionTableLength(_p.companion_table_length),
+      _companionThreshold(_p.companion_threshold),
+      _trrStatDump(_p.trr_stat_dump),
+      _rhStatDump(_p.rh_stat_dump),
+      _rhStatFile(_p.rh_stat_file),
+      _singleSidedProb(_p.single_sided_prob),
+      _halfDoubleProb(_p.half_double_prob),
+      _doubleSidedProb(_p.double_sided_prob),
+      _enableMemoryCorruption(_p.enable_memory_corruption),
+      _enableEcc(_p.enable_ecc),
+      _rhGenerator(std::random_device{}()),
+      // ----------------------------------------------------------------
       stats(*this)
 {
     DPRINTF(DRAM, "Setting up DRAM Interface\n");
@@ -738,6 +870,14 @@ DRAMInterface::DRAMInterface(const DRAMInterfaceParams &_p)
     }
 }
 
+DRAMInterface::~DRAMInterface()
+{
+    // ECC snapshots are owned raw-new allocations; drain any entries
+    // that outlived their matching read so the simulation exits clean.
+    for (auto &kv : _eccVictims)
+        delete[] kv.second;
+}
+
 void
 DRAMInterface::init()
 {
@@ -778,6 +918,61 @@ DRAMInterface::init()
             assert(burstsPerStripe <= burstsPerRowBuffer);
         }
     }
+
+    // ---------------- rowhammer port ----------------
+    // bank-level bookkeeping, random distributions, and device-map
+    // load. entirely gated on _enableMemoryCorruption so the default
+    // configuration sees zero overhead.
+    if (_enableMemoryCorruption) {
+        _rhHdDist = std::uniform_int_distribution<uint64_t>(
+            std::numeric_limits<uint64_t>::min(), _halfDoubleProb);
+        _rhSingleSidedDist = std::uniform_int_distribution<uint64_t>(
+            std::numeric_limits<uint64_t>::min(), _singleSidedProb);
+        _rhDoubleSidedDist = std::uniform_int_distribution<uint64_t>(
+            std::numeric_limits<uint64_t>::min(), _doubleSidedProb);
+
+        for (int r = 0; r < ranksPerChannel; r++) {
+            for (size_t b = 0; b < ranks[r]->banks.size(); b++) {
+                Bank &bk = ranks[r]->banks[b];
+                bk.rhTriggers.assign(rowsPerBank,
+                                     std::vector<long int>(4, 0));
+                bk.aggressor_rows.assign(rowsPerBank, 0);
+                bk.weakColumns.assign(rowsPerBank, std::bitset<1024>());
+                bk.flagged_entries.assign(rowsPerBank,
+                                          std::vector<bool>(1024, false));
+            }
+        }
+
+        // load the JSON device-variation map. if the file is missing or
+        // malformed, log a warning and continue with an empty map: the
+        // column-lookup path in checkRowHammer() will then bail out
+        // gracefully (no flips), which is the desired behaviour when
+        // the user hasn't provided a map.
+        std::ifstream f(_deviceFile);
+        if (f.good()) {
+            try {
+                _rhDeviceMap = nlohmann::json::parse(f);
+            } catch (const std::exception &e) {
+                warn("Rowhammer: failed to parse device map at %s: %s\n",
+                     _deviceFile, e.what());
+                _rhDeviceMap = nlohmann::json::object();
+            }
+        } else {
+            warn("Rowhammer: device map %s not found; corruption enabled "
+                 "but no flips will be emitted.\n", _deviceFile);
+            _rhDeviceMap = nlohmann::json::object();
+        }
+    }
+    // ----------------------------------------------------------
+
+    // ---------------- rowhammer port (ECC) ----------------
+    // allocate the SECDED parity matrix once, only when ECC is enabled.
+    // placed outside the _enableMemoryCorruption block so ECC can be
+    // toggled independently (in which case the maps remain empty).
+    if (_enableEcc) {
+        _pMatrix.reset(makeSECDED_P64x8());
+    }
+    // ---------------------------------------------------------------
 }
 
 void
@@ -1908,7 +2103,18 @@ DRAMInterface::DRAMStats::DRAMStats(DRAMInterface &_dram)
              "Data bus utilization in percentage for writes"),
 
     ADD_STAT(pageHitRate, statistics::units::Ratio::get(),
-             "Row buffer hit rate, read and write combined")
+             "Row buffer hit rate, read and write combined"),
+
+    ADD_STAT(rowHammerBitflips, statistics::units::Count::get(),
+             "Number of Rowhammer bit flips injected by "
+             "doMemoryCorruption()"),
+
+    ADD_STAT(rowHammerEccCorrected, statistics::units::Count::get(),
+             "Rowhammer bit flips corrected by SECDED ECC"),
+
+    ADD_STAT(rowHammerEccUncorrectable, statistics::units::Count::get(),
+             "Rowhammer multi-bit errors detected as uncorrectable "
+             "by SECDED ECC")
 
 {
 }
@@ -2028,6 +2234,295 @@ DRAMInterface::RankStats::preDumpStats()
 
     rank.computeStats();
 }
+
+// ---------------- rowhammer port ----------------
+// ported from HammerSim (gem5 v23.0.1). differences from
+// the source fork:
+//   - ECC paths stripped entirely (computeECCByte / pMatrix /
+//     ecc_victims / ecc_columns / multiple_errors).
+//   - TRR variants 1-4 dropped; only trr_variant == 0 (no mitigation)
+//     is honoured here.
+//   - rh_stat_dump / trr_stat_dump file writers stripped.
+//   - rowhammer gem5 stats (rowHammer*Bitflips) not registered yet.
+//   - syntheticTraffic probability mixing removed.
+//   - the address-reconstruction fatal_if in doMemoryCorruption() is
+//     demoted to warn_if to tolerate RoRaBaChCo single-channel
+//     configurations (see COMPATIBILITY.md).
+
+void
+DRAMInterface::rhUpdateTriggers(Bank& bank_ref, uint32_t row)
+{
+    // mirrors updateVictims() from the source fork: bump ±1/±2
+    // neighbour counters used by checkRowHammer. edge rows receive a
+    // subset of the increments to stay within the rhTriggers vector.
+    if (bank_ref.rhTriggers.empty())
+        return;
+
+    if ((row <= 1) || (row >= rowsPerBank - 2)) {
+        if (row == 0) {
+            if (bank_ref.rhTriggers[row][1]++ % 1024 == 0)
+                bank_ref.rhTriggers[row][0]++;
+        } else if (row == 1) {
+            bank_ref.rhTriggers[row][2]++;
+            bank_ref.rhTriggers[row][1]++;
+            bank_ref.rhTriggers[row][0]++;
+        } else if (row == rowsPerBank - 1) {
+            bank_ref.rhTriggers[row][3]++;
+            bank_ref.rhTriggers[row][2]++;
+        } else if (row == rowsPerBank - 2) {
+            bank_ref.rhTriggers[row][3]++;
+            bank_ref.rhTriggers[row][2]++;
+            bank_ref.rhTriggers[row][1]++;
+        }
+    } else {
+        bank_ref.rhTriggers[row][0]++;
+        bank_ref.rhTriggers[row][1]++;
+        bank_ref.rhTriggers[row][2]++;
+        bank_ref.rhTriggers[row][3]++;
+    }
+}
+
+void
+DRAMInterface::checkRowHammer(Bank& bank_ref, MemPacket* mem_pkt)
+{
+    // early-out if rh bookkeeping wasn't set up. this both shields the
+    // vector indexing below and covers the case where corruption is
+    // enabled at construction time but disabled later.
+    if (!_enableMemoryCorruption || bank_ref.rhTriggers.empty())
+        return;
+
+    const uint32_t row = mem_pkt->row;
+    const std::string bank_key = std::to_string(bank_ref.bank);
+
+    // ----- half-double: victim at row - 2 -----
+    if (row >= 2 &&
+        bank_ref.rhTriggers[row - 1][1] >= 1 &&
+        bank_ref.rhTriggers[row][1] >= 1000) {
+
+        bool bitflip = (_rhHdDist(_rhGenerator) == 1);
+        uint16_t col = 0;
+        const std::string victim_key = std::to_string(row - 2);
+
+        auto &slot = _rhDeviceMap["0"][bank_key][victim_key];
+        if (!slot.is_null()) {
+            uint16_t sz = static_cast<uint16_t>(slot.size());
+            if (sz == 0) {
+                bitflip = false;
+            } else {
+                uint16_t idx =
+                    static_cast<uint16_t>(_rhHdDist(_rhGenerator) % sz);
+                col = static_cast<uint16_t>(slot[idx]);
+                if (bank_ref.flagged_entries[row - 2][col])
+                    bitflip = false;
+                bank_ref.flagged_entries[row - 2][col] = true;
+            }
+        } else {
+            bitflip = false;
+        }
+
+        if (bitflip)
+            doMemoryCorruption(mem_pkt, bank_ref.bank, row - 2, col, -2);
+    }
+
+    // ----- half-double: victim at row + 2 -----
+    if (row <= rowsPerBank - 3 &&
+        bank_ref.rhTriggers[row + 1][2] >= 1 &&
+        bank_ref.rhTriggers[row][2] >= 1000) {
+
+        bool bitflip = (_rhHdDist(_rhGenerator) == 1);
+        uint16_t col = 0;
+        const std::string victim_key = std::to_string(row + 2);
+
+        auto &slot = _rhDeviceMap["0"][bank_key][victim_key];
+        if (!slot.is_null()) {
+            uint16_t sz = static_cast<uint16_t>(slot.size());
+            if (sz == 0) {
+                bitflip = false;
+            } else {
+                uint16_t idx =
+                    static_cast<uint16_t>(_rhHdDist(_rhGenerator) % sz);
+                col = static_cast<uint16_t>(slot[idx]);
+                if (bank_ref.flagged_entries[row + 2][col])
+                    bitflip = false;
+                bank_ref.flagged_entries[row + 2][col] = true;
+            }
+        } else {
+            bitflip = false;
+        }
+
+        if (bitflip)
+            doMemoryCorruption(mem_pkt, bank_ref.bank, row + 2, col, 2);
+    }
+
+    // ----- standard rowhammer: victim at row - 1 -----
+    if (bank_ref.rhTriggers[row][1] >= _rowhammerThreshold) {
+        bool single_sided = true;
+        bool bitflip = false;
+
+        if (row >= 2 &&
+            bank_ref.aggressor_rows[row]     >= _rowhammerThreshold / 2 &&
+            bank_ref.aggressor_rows[row - 2] >= _rowhammerThreshold / 2) {
+            single_sided = false;
+            bitflip = true;
+        }
+
+        if (single_sided) {
+            if (_rhSingleSidedDist(_rhGenerator) == 1)
+                bitflip = true;
+        } else {
+            if (_rhDoubleSidedDist(_rhGenerator) == 1)
+                bitflip = true;
+        }
+
+        uint16_t col = 0;
+        if (row > 0) {
+            const std::string victim_key = std::to_string(row - 1);
+            auto &slot = _rhDeviceMap["0"][bank_key][victim_key];
+            if (!slot.is_null()) {
+                uint16_t sz = static_cast<uint16_t>(slot.size());
+                if (sz == 0) {
+                    bitflip = false;
+                } else {
+                    uint16_t idx = static_cast<uint16_t>(
+                        _rhSingleSidedDist(_rhGenerator) % sz);
+                    col = static_cast<uint16_t>(slot[idx]);
+                    if (bank_ref.flagged_entries[row - 1][col])
+                        bitflip = false;
+                    bank_ref.flagged_entries[row - 1][col] = true;
+                }
+            } else {
+                bitflip = false;
+            }
+
+            if (bitflip)
+                doMemoryCorruption(mem_pkt, bank_ref.bank, row - 1,
+                                   col, -1);
+        }
+    }
+
+    // ----- standard rowhammer: victim at row + 1 -----
+    if (bank_ref.rhTriggers[row][2] >= _rowhammerThreshold) {
+        bool single_sided = true;
+        bool bitflip = false;
+
+        if (row + 3 < rowsPerBank &&
+            bank_ref.aggressor_rows[row]     >= _rowhammerThreshold / 2 &&
+            bank_ref.aggressor_rows[row + 2] >= _rowhammerThreshold / 2) {
+            single_sided = false;
+            bitflip = true;
+        }
+
+        if (single_sided) {
+            if (_rhSingleSidedDist(_rhGenerator) == 1)
+                bitflip = true;
+        } else {
+            if (_rhDoubleSidedDist(_rhGenerator) == 1)
+                bitflip = true;
+        }
+
+        uint16_t col = 0;
+        if (row + 2 < rowsPerBank) {
+            const std::string victim_key = std::to_string(row + 1);
+            auto &slot = _rhDeviceMap["0"][bank_key][victim_key];
+            if (!slot.is_null()) {
+                uint16_t sz = static_cast<uint16_t>(slot.size());
+                if (sz == 0) {
+                    bitflip = false;
+                } else {
+                    uint16_t idx = static_cast<uint16_t>(
+                        _rhSingleSidedDist(_rhGenerator) % sz);
+                    col = static_cast<uint16_t>(slot[idx]);
+                    if (bank_ref.flagged_entries[row + 1][col])
+                        bitflip = false;
+                    bank_ref.flagged_entries[row + 1][col] = true;
+                }
+            } else {
+                bitflip = false;
+            }
+
+            if (bitflip)
+                doMemoryCorruption(mem_pkt, bank_ref.bank, row + 1,
+                                   col, 1);
+        }
+    }
+}
+
+void
+DRAMInterface::doMemoryCorruption(MemPacket* mem_pkt, uint8_t /*bank*/,
+                                  uint32_t victim_row, uint16_t col,
+                                  int distance)
+{
+    // reconstruct the victim row's host-backed address by offsetting
+    // the aggressor address by `distance` rows. matches the source
+    // fork — which assumes RoRaBaCoCh addressing; single-channel
+    // configurations give the same layout under RoRaBaChCo.
+    const Addr ctrl_off  = getCtrlAddr(mem_pkt->addr);
+    const Addr row_bytes = banksPerRank * burstsPerRowBuffer * burstSize;
+    const Addr next_ctrl = ctrl_off + (distance * row_bytes);
+    const Addr addr = range.start() + next_ctrl;
+
+    const uint32_t new_row =
+        (addr / burstSize / burstsPerRowBuffer / banksPerRank)
+        % rowsPerBank;
+
+    // the source fork fatal_if's on a mismatch; under RoRaBaChCo with
+    // >1 channel the simple divide-based decode can legitimately skew,
+    // so demote to a warn to keep the simulation alive. flip is still
+    // applied — correctness of the target column in multi-channel
+    // mappings is a concern per COMPATIBILITY.md §7.
+    warn_if(new_row != mem_pkt->row + distance,
+            "Rowhammer: victim row %d from recomputed addr differs from "
+            "expected row %d (aggressor %d, distance %d)\n",
+            new_row, victim_row, mem_pkt->row, distance);
+
+    const size_t row_size = rowBufferSize;
+    uint8_t *host_addr = toHostAddr(addr);
+    assert(host_addr);
+
+    // read the row, flip one random bit in the targeted column, write
+    // it back. there are 8 bits per column byte in an 8x8 dimm — we
+    // flip one of them uniformly at random.
+    std::vector<uint8_t> buf(row_size);
+    std::memcpy(buf.data(), host_addr, row_size);
+
+    if (col < row_size) {
+        // ------------ rowhammer port (ECC) ------------
+        // snapshot the pre-flip row so the read path can recompute
+        // the original ECC byte. first corruption at a given row-
+        // aligned addr stores the snapshot; subsequent corruptions
+        // bump the multi-error counter (SECDED cannot correct 2+
+        // bits in the same 64-bit word).
+        if (_enableEcc) {
+            if (auto it = _eccVictims.find(addr);
+                it != _eccVictims.end()) {
+                _eccMultipleErrors[addr]++;
+                DPRINTF(DRAM,
+                        "ECC: multi-corrupt at %#x count=%u\n",
+                        addr, _eccMultipleErrors[addr]);
+            } else {
+                uint8_t *snap = new uint8_t[row_size];
+                std::memcpy(snap, buf.data(), row_size);
+                _eccVictims[addr] = snap;
+                _eccColumns[addr] = col;
+                _eccMultipleErrors[addr] = 1;
+                DPRINTF(DRAM, "ECC: snap at %#x col=%u\n",
+                        addr, col);
+            }
+        }
+        // -------------------------------------------------------
+
+        const uint64_t corrupt_bit =
+            _rhHdDist(_rhGenerator) % 8;
+        buf[col] ^= static_cast<uint8_t>(1u << corrupt_bit);
+        std::memcpy(host_addr, buf.data(), row_size);
+        stats.rowHammerBitflips++;
+        DPRINTF(DRAM,
+                "Rowhammer: flipped bit %llu at bank %d row %d col %d\n",
+                corrupt_bit, static_cast<int>(mem_pkt->bank),
+                victim_row, col);
+    }
+}
+// ----------------------------------------------------------
 
 } // namespace memory
 } // namespace gem5

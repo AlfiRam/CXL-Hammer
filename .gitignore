@@ -41,3 +41,9 @@ Doxygen.config
 typings
 include/cxl_benchmark/lmbench3
 /output
+
+# cxl-hammer specific
+/benchmarks/rowhammer_cxl_test
+/benchmarks/*.o
+/m5out/rh_*/
+/fs_files/

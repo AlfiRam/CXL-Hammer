@@ -271,6 +271,45 @@ class DRAMInterface(MemInterface):
     # Second voltage range defined by some DRAMs
     VDD2 = Param.Voltage("0V", "2nd Voltage Range")
 
+    # -------------- rowhammer parameters (scaffolding) --------------
+    # all defaults are behavior-neutral: enable_memory_corruption is False and
+    # trr_variant is 0 (disabled) so untouched configs behave as before.
+    device_file = Param.String(
+        "util/hammersim/prob-test.json",
+        "Path to device variation map (JSON)",
+    )
+    rowhammer_threshold = Param.UInt64(
+        50000, "Activations to trigger flip (DDR4)"
+    )
+    trr_variant = Param.UInt32(0, "TRR mitigation variant (0=none)")
+    trr_threshold = Param.UInt64(32768, "TRR refresh threshold")
+    counter_table_length = Param.UInt32(16, "TRR table size")
+    companion_table_length = Param.UInt32(8, "TRR companion table size")
+    companion_threshold = Param.UInt64(
+        1024, "Threshold for TRR companion promotion"
+    )
+    trr_stat_dump = Param.Bool(False, "Enable TRR trace logging")
+    rh_stat_dump = Param.Bool(False, "Enable Rowhammer trace logging")
+    rh_stat_file = Param.String(
+        "m5out/rowhammer.trace", "Output path for RH trace"
+    )
+    single_sided_prob = Param.UInt64(
+        10000000, "Inverse probability for single-sided flips"
+    )
+    half_double_prob = Param.UInt64(
+        1000000000, "Inverse probability for half-double flips"
+    )
+    double_sided_prob = Param.UInt64(
+        100000, "Inverse probability for double-sided flips"
+    )
+    enable_memory_corruption = Param.Bool(
+        False, "Enable actual bit flips in memory"
+    )
+    enable_ecc = Param.Bool(
+        False, "Enable SECDED ECC recovery for Rowhammer flips"
+    )
+    # -------------------------------------------------------------------------
+
     def controller(self):
         """
         Instantiate the memory controller and bind it to

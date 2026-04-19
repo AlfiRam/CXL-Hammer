@@ -46,6 +46,11 @@
 #ifndef __DRAM_INTERFACE_HH__
 #define __DRAM_INTERFACE_HH__
 
+#include <cstdint>
+#include <memory>
+#include <random>
+#include <unordered_map>
+
 #include "mem/drampower.hh"
 #include "mem/mem_interface.hh"
 #include "params/DRAMInterface.hh"
@@ -576,6 +581,165 @@ class DRAMInterface : public MemInterface
                        Tick pre_tick, bool auto_or_preall = false,
                        bool trace = true);
 
+    // ---------------- rowhammer port (scaffolding) ----------------
+    // method declarations are added here; definitions are stubbed in
+    // dram_interface.cc. wiring into activateBank()/doBurstAccess() is
+    // deferred per the port plan.
+
+    /** check whether the current activation triggers a rowhammer event. */
+    void checkRowHammer(Bank& bank_ref, MemPacket* mem_pkt);
+
+    /**
+     * apply a memory corruption (bit flip) to the victim row at a given
+     * column offset and aggressor-victim distance.
+     */
+    void doMemoryCorruption(MemPacket* mem_pkt, uint8_t bank,
+                            uint32_t victim_row, uint16_t col, int distance);
+
+    // parameter-mirrored private members. populated from the python
+    // SimObject params in the DRAMInterface constructor.
+    const std::string   _deviceFile;
+    const uint64_t      _rowhammerThreshold;
+    const uint32_t      _trrVariant;
+    const uint64_t      _trrThreshold;
+    const uint32_t      _counterTableLength;
+    const uint32_t      _companionTableLength;
+    const uint64_t      _companionThreshold;
+    const bool          _trrStatDump;
+    const bool          _rhStatDump;
+    const std::string   _rhStatFile;
+    const uint64_t      _singleSidedProb;
+    const uint64_t      _halfDoubleProb;
+    const uint64_t      _doubleSidedProb;
+    const bool          _enableMemoryCorruption;
+    const bool          _enableEcc;
+
+    // runtime rh state. all gated on _enableMemoryCorruption: when the
+    // feature is disabled, these remain default-constructed and cost
+    // nothing.
+    std::mt19937_64 _rhGenerator;
+    std::uniform_int_distribution<uint64_t> _rhHdDist;
+    std::uniform_int_distribution<uint64_t> _rhSingleSidedDist;
+    std::uniform_int_distribution<uint64_t> _rhDoubleSidedDist;
+    nlohmann::json _rhDeviceMap;
+    bool _rhFirstAct = false;
+
+    // runtime ECC state. all gated on _enableEcc: when the
+    // feature is disabled, pMatrix stays null and the maps remain
+    // default-constructed (empty).
+    std::unique_ptr<uint8_t[]> _pMatrix;
+    std::unordered_map<Addr, uint8_t*>      _eccVictims;
+    std::unordered_map<Addr, uint16_t>      _eccColumns;
+    std::unordered_map<Addr, unsigned int>  _eccMultipleErrors;
+
+    /** bump per-row activation counters used by checkRowHammer(). */
+    void rhUpdateTriggers(Bank& bank_ref, uint32_t row);
+
+    // ----- SECDED math (ported from gem5-rowhammer) -----
+    // functions are semantic copies of
+    // ~/gem5-rowhammer/src/mem/dram_interface.hh:617-710, reformatted
+    // for gem5's 79-column style.
+
+    // build the 64x8 SECDED parity matrix (hamming checks in cols 0..6,
+    // overall parity in col 7). caller wraps the returned pointer in a
+    // unique_ptr<uint8_t[]> for automatic cleanup.
+    static inline uint8_t* makeSECDED_P64x8()
+    {
+        const std::size_t rows = 64;
+        const std::size_t cols = 8;
+
+        uint8_t* P = new uint8_t[rows * cols];
+
+        for (std::size_t i = 0; i < rows; ++i) {
+            const std::size_t one_based = i + 1;
+            for (std::size_t j = 0; j < cols; ++j) {
+                uint8_t val = (j < 7)
+                    ? static_cast<uint8_t>((one_based >> j) & 0x1)
+                    : static_cast<uint8_t>(1);
+                *(P + i * cols + j) = val;
+            }
+        }
+        return P;
+    }
+
+    // extract data bit i (0..63) from an 8-byte chunk, msb-first.
+    static inline uint8_t
+    getDataBitMSBF(uint8_t* data, std::size_t i)
+    {
+        const std::size_t byteIdx = i / 8;
+        const int bitPos = 7 - static_cast<int>(i % 8);
+        return static_cast<uint8_t>(
+            (*(data + byteIdx) >> bitPos) & 0x1);
+    }
+
+    // compute the 8-bit ECC byte (msb-first) from a 64-bit data chunk
+    // using a flat 64x8 parity matrix (only lsb of each entry used).
+    static inline uint8_t
+    computeECCByte_MSBF(const uint8_t* pMatrix, uint8_t* data)
+    {
+        uint8_t ecc = 0;
+        for (std::size_t j = 0; j < 8; ++j) {
+            uint8_t parity = 0;
+            for (std::size_t i = 0; i < 64; ++i) {
+                const uint8_t di = getDataBitMSBF(data, i);
+                const uint8_t pij = static_cast<uint8_t>(
+                    *(pMatrix + i * 8 + j) & 0x1);
+                parity ^= (di & pij);
+            }
+            if (parity & 0x1)
+                ecc |= static_cast<uint8_t>(1u << (7 - j));
+        }
+        return ecc;
+    }
+
+    // pack P[i,*] into an msb-first byte (signature of data bit i).
+    static inline uint8_t
+    dataBitSignature_MSBF(const uint8_t* pMatrix, std::size_t i)
+    {
+        uint8_t sig = 0;
+        for (std::size_t j = 0; j < 8; ++j)
+            if ((*(pMatrix + i * 8 + j) & 0x1) != 0)
+                sig |= static_cast<uint8_t>(1u << (7 - j));
+        return sig;
+    }
+
+    // correct at most one bit in-place.
+    // returns: 0 = clean, 1 = data bit corrected, 2 = ECC bit flipped,
+    // -1 = uncorrectable (multi-bit or unsuitable P).
+    static inline int
+    correctOneBit_MSBF(uint8_t* new_data, uint8_t* ecc,
+                       const uint8_t* pMatrix)
+    {
+        const uint8_t eccComputed =
+            computeECCByte_MSBF(pMatrix, new_data);
+        const uint8_t syndrome =
+            static_cast<uint8_t>((*ecc) ^ eccComputed);
+
+        if (syndrome == 0) return 0;
+
+        for (std::size_t j = 0; j < 8; ++j) {
+            const uint8_t unit = static_cast<uint8_t>(1u << (7 - j));
+            if (syndrome == unit) {
+                *ecc ^= unit;
+                return 2;
+            }
+        }
+
+        for (std::size_t i = 0; i < 64; ++i) {
+            const uint8_t sig = dataBitSignature_MSBF(pMatrix, i);
+            if (sig == syndrome) {
+                const std::size_t byteIdx = i / 8;
+                const int bitPos = 7 - static_cast<int>(i % 8);
+                *(new_data + byteIdx) ^=
+                    static_cast<uint8_t>(1u << bitPos);
+                return 1;
+            }
+        }
+
+        return -1;
+    }
+    // -----------------------------------------------------------------------
+
     struct DRAMStats : public statistics::Group
     {
         DRAMStats(DRAMInterface &dram);
@@ -622,6 +786,12 @@ class DRAMInterface : public MemInterface
         statistics::Formula busUtilRead;
         statistics::Formula busUtilWrite;
         statistics::Formula pageHitRate;
+
+        // rowhammer port: count of bit flips actually
+        // injected by doMemoryCorruption().
+        statistics::Scalar rowHammerBitflips;
+        statistics::Scalar rowHammerEccCorrected;
+        statistics::Scalar rowHammerEccUncorrectable;
     };
 
     DRAMStats stats;
@@ -801,6 +971,7 @@ class DRAMInterface : public MemInterface
     bool writeRespQueueFull() const override { return false;}
 
     DRAMInterface(const DRAMInterfaceParams &_p);
+    ~DRAMInterface() override;
 };
 
 } // namespace memory
