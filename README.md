@@ -1,20 +1,16 @@
-# CXL-DMSim
+# CXL-Hammer
 
-CXL-DMSim is a full-system CXL disaggregated memory simulator based on gem5.
+CXL-Hammer is a gem5-based proof-of-concept work of Rowhammer attacks on CXL Type 3 disaggregated memory. It ports a behavioral Rowhammer disturbance model onto the CXL memory path modeled by CXL-DMSim, and adds an optional SECDED ECC recovery layer at the CXL DRAM interface.
+
+## Based on
+
+- **Base simulator**: [CXL-DMSim](https://github.com/ferry-hhh/CXL-DMSim), forked at commit `6d2a3f76`.
+- **Rowhammer model**: [HammerSim](https://arch.cs.ucdavis.edu/memory/simulation/security/2023/03/20/yarch-hammersim.html), source at [darchr/gem5-rowhammer](https://github.com/darchr/gem5-rowhammer).
+- **JSON library**: [nlohmann/json](https://github.com/nlohmann/json) (MIT licensed, vendored at `ext/json/json/single_include/`).
 
 ## Requirements
 
-To build CXL-DMSim, you need to satisfy the dependencies of gem5 version 23.10. We recommend running on Ubuntu 20.04 or 22.04.
-
-- gcc 9.4.0+
-- SCons 3.0+
-- Python 3.6+
-
-The main website can be found at [gem5.org](http://www.gem5.org/).
-
-A good starting point is [Introduction to gem5](http://www.gem5.org/Introduction), and for more information about building the simulator and getting started, please see the [Documentation](http://www.gem5.org/Documentation) and [Tutorials](http://www.gem5.org/Tutorials).
-
-## Setup on Ubuntu 20.04 or 22.04
+Same as gem5 v23.10. Recommended on Ubuntu 20.04 or 22.04:
 
 ```bash
 sudo apt install build-essential git m4 scons zlib1g zlib1g-dev \
@@ -22,91 +18,78 @@ sudo apt install build-essential git m4 scons zlib1g zlib1g-dev \
     python3-dev python-is-python3 libboost-all-dev pkg-config
 ```
 
-## Building CXL-DMSim
+KVM must be accessible on the host (`/dev/kvm`).
 
-1. Once you have successfully installed all of the necessary dependencies, you can clone the CXL-DMSim repository to begin working with it.
+## Clone
 
 ```bash
-git clone https://github.com/ferry-hhh/CXL-DMSim.git
+git clone https://github.com/AlfiRam/CXL-Hammer.git
+cd CXL-Hammer
 ```
 
-2. When building CXL-DMSim, there are multiple binary types that can be created. Just like in gem5, the options are opt, fast, and debug. In general, the opt version is the best in most circumstances. 
-
-   Additionally, CXL-DMSim currently only supports modeling of the x86 architecture.
-
-   Type the following command to build the simulator:
+## Build
 
 ```bash
-scons build/X86/gem5.opt -j`nproc`
-```
+# build the simulator
+scons build/X86/gem5.opt -j$(nproc)
 
-Note that the `-j` flag is optional and allows for parallelization of compilation with `nproc` specifying the number of threads. A single-threaded compilation from scratch can take up to 2 hours on some systems. We therefore strongly advise allocating more threads if possible.
-
-## Using CXL-DMSim
-
-CXL-DMSim is a full-system simulator based on gem5. To start the full system, two files are required: a Linux Kernel and a Disk Image.
-
-- **Linux Kernel**: In full-system mode, gem5 boots the operating system by loading a compiled Linux Kernel, which includes necessary resource management modules and device drivers. We provide a [Linux Kernel](https://drive.google.com/drive/folders/1sxZBsedT19ntJdzN8MTkcbczMGXNXgrM?usp=sharing) file with added drivers for CXL devices, version 5.4.49.
-- **Disk Image**: In full-system mode, the simulator relies on the Disk Image to run the simulation programs. Users can copy the executable programs to be tested into the Disk Image for execution after the full system starts. We provide a [Disk Image](https://drive.google.com/drive/folders/1sxZBsedT19ntJdzN8MTkcbczMGXNXgrM?usp=sharing) that includes the LMbench, Stream, Viper, and Meric test programs.
-
-Both of these files can be created or compiled following the [gem5 documentation](https://www.gem5.org/documentation/general_docs/fullsystem/disks), or downloaded from the [gem5 resources repository](https://resources.gem5.org/).
-
-1. Please check that the paths for `Kernel` and `disk_image` in `configs/example/gem5_library/x86-cxl-run.py` correspond to the paths on your computer.
-
-2. Enter the following command to start the full system. By default, it allocates CXL-ASIC Device memory to run the lmbench latency benchmark test. The results of the program execution are saved by default in `m5out/board.pc.com_1.device`.
-
-```bash
-build/X86/gem5.opt configs/example/gem5_library/x86-cxl-run.py
-```
-
-For more configurable system component parameters, please refer to the [gem5 standard library](https://www.gem5.org/documentation/gem5-stdlib/overview). You can also use `x86-cxl-run.py` as a reference to customize your system configuration file.
-
-3. Install `m5term`.
-
-   `m5term` allows users to connect to the simulated terminal provided by the full system. Follow these steps:
-
-```bash
-cd util/term
+# build the hammer workload
+cd benchmarks
 make
-sudo install -o root -m 555 m5term /usr/local/bin
+cd ..
 ```
 
-4. After starting the full system, enter the terminal with the following command:
+## Kernel and disk image
+
+This simulation requires a gem5-compatible x86 Linux kernel and a disk image with a Linux root filesystem. These are not included in this repository due to size.
+
+Download them from the upstream CXL-DMSim project's Google Drive:
+
+https://drive.google.com/drive/folders/1sxZBsedT19ntJdzN8MTkcbczMGXNXgrM
+
+Place the files at:
+
+```
+fs_files/vmlinux_20240920
+fs_files/parsec.img
+```
+
+The `fs_files/` directory is gitignored and must be created by the user. If your downloaded kernel has a different filename, either rename it to `vmlinux_20240920` or edit `configs/example/gem5_library/x86-cxl-hammer.py` to match.
+
+## Install the hammer binary into the disk image
+
+The workload binary must live inside the guest filesystem at `/home/cxl_benchmark/rowhammer_cxl_test`. The disk image must also have `numactl` installed; install it via `apt` in the mounted image if it isn't already present.
 
 ```bash
-m5term localhost 3456
+sudo mkdir -p /tmp/parsec_mount
+sudo mount -o loop,offset=$((2048*512)) fs_files/parsec.img /tmp/parsec_mount
+
+cd benchmarks
+make install
+cd ..
+
+sudo umount /tmp/parsec_mount
 ```
 
-## Managing CXL Memory in the Full System
+## Run the simulation
 
-CXL Device is recognized as a CPU-less NUMA node in the system. We provide two ways to manage CXL memory allocation.
-
-1. **Via numactl**
-
-   Users can allocate CXL memory using standard numactl commands, for example:
-
-   ```bash
-   numactl --membind=1 --cpunodebind=0 ./lat_mem_rd -t -N 2 1024 64
-   ```
-
-   This command will run the `lat_mem_rd` program on CPU0, with memory allocation bound to NUMA node 1, which is the CXL memory in the system. You can also use options like `interleave` and `preferred` to mix DRAM and CXL memory.
-
-2. **Via mmap/memkind**
-
-   The CXL device driver provides an mmap system call to allocate CXL memory.
-
-## Citation
-If you find CXL-DMSim useful for your own work, please cite our paper as follows.
-```tex
-@ARTICLE{11153390,
-  author={Wang, Yanjing and Wu, Lizhou and Hong, Wentao and Ou, Yang and Wang, Zicong and Gao, Sunfeng and Zhang, Jie and Ma, Sheng and Dong, Dezun and Qi, Xingyun and Lai, Mingche and Xiao, Nong},
-  journal={IEEE Transactions on Computer-Aided Design of Integrated Circuits and Systems}, 
-  title={CXL-DMSim: A Full-System CXL Disaggregated Memory Simulator With Comprehensive Silicon Validation}, 
-  year={2025},
-  volume={},
-  number={},
-  pages={1-1},
-  doi={10.1109/TCAD.2025.3607145},
-  url={https://ieeexplore.ieee.org/document/11153390}
-}
+```bash
+./build/X86/gem5.opt -d m5out/cxl_hammer \
+    configs/example/gem5_library/x86-cxl-hammer.py
 ```
+
+The config ships with `enable_ecc=True`. To run the ECC-off condition, edit `configs/example/gem5_library/x86-cxl-hammer.py` and change `enable_ecc=True` to `enable_ecc=False`.
+
+## Results
+
+After the simulation finishes, gem5 writes all output to `m5out/cxl_hammer/`, especially the stats.txt file:
+
+- **`m5out/cxl_hammer/stats.txt`** — gem5 statistics dump. Rowhammer and ECC counters are reported per CXL DRAM channel under `board.cxl_memory.mem_ctrl.dram.*`. Key counters to grep for:
+
+```bash
+  grep "board.cxl_memory.mem_ctrl.dram.rowHammer" m5out/cxl_hammer/stats.txt
+```
+
+## License
+
+Upstream CXL-DMSim and gem5 code retain their original BSD 3-clause license. The vendored nlohmann/json library retains the MIT license (`ext/json/json/LICENSE.MIT`). Additions in this repository are released under BSD 3-clause to match the base.
