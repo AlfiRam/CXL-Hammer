@@ -89,7 +89,3 @@ After the simulation finishes, gem5 writes all output to `m5out/cxl_hammer/`, es
 ```bash
   grep "board.cxl_memory.mem_ctrl.dram.rowHammer" m5out/cxl_hammer/stats.txt
 ```
-
-## License
-
-Upstream CXL-DMSim and gem5 code retain their original BSD 3-clause license. The vendored nlohmann/json library retains the MIT license (`ext/json/json/LICENSE.MIT`). Additions in this repository are released under BSD 3-clause to match the base.
