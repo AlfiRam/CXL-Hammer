@@ -1,6 +1,6 @@
 # CXL-Hammer
 
-CXL-Hammer is a gem5-based proof-of-concept work of Rowhammer attacks on CXL Type 3 disaggregated memory. It ports a behavioral Rowhammer disturbance model onto the CXL memory path modeled by CXL-DMSim, and adds an optional SECDED ECC recovery layer at the CXL DRAM interface.
+CXL-Hammer is a gem5-based proof-of-concept work of Rowhammer attacks on CXL Type 3 disaggregated memory.
 
 ## Based on
 
